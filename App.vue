@@ -182,7 +182,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, watch } from 'vue'
+import { ref, computed, nextTick, watch } from 'vue'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/atom-one-dark.css'
@@ -208,26 +208,93 @@ function renderMarkdown(text) {
   }
 }
 
-// ========== State ==========
-const question = ref('')
-const messages = ref([])
-const isStreaming = ref(false)
-const isWaiting = ref(false) // true between send and first token
-const sidebarCollapsed = ref(false)
-const messagesContainer = ref(null)
-const inputEl = ref(null)
-
-// Abort controller for stopping streams
-let abortController = null
-
-// Chat history (simple in-memory, clear on refresh)
-const chatHistory = ref([])
-const activeChatId = ref(genId())
-let historySaveTimer = null
-
+// ========== ID Generator ==========
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
 }
+
+// ========== localStorage Persistence ==========
+const STORAGE_KEY = 'rag_chat_sessions'
+
+function loadSessions() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (typeof parsed === 'object' && Object.keys(parsed).length > 0) return parsed
+    return null
+  } catch {
+    return null
+  }
+}
+
+let persistTimer = null
+function schedulePersist() {
+  clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions.value))
+    } catch { /* quota exceeded, ignore */ }
+  }, 500)
+}
+
+// ========== Core Data: All Sessions ==========
+// Structure: { [chatId]: { title, messages: [...], updatedAt: timestamp } }
+const sessions = ref({})
+const activeChatId = ref(null)
+const sidebarCollapsed = ref(false)
+
+// Derived: current chat's messages (template reads this directly)
+const messages = computed(() => {
+  const id = activeChatId.value
+  return sessions.value[id]?.messages ?? []
+})
+
+// Derived: sidebar chat list, sorted by most recent
+const chatHistory = computed(() => {
+  return Object.entries(sessions.value)
+    .map(([id, s]) => ({ id, title: s.title, updatedAt: s.updatedAt }))
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+})
+
+// ========== Session Helpers ==========
+function ensureSession(id) {
+  if (!sessions.value[id]) {
+    sessions.value[id] = { title: '新对话', messages: [], updatedAt: Date.now() }
+    schedulePersist()
+  }
+}
+
+function touchSession(id) {
+  if (sessions.value[id]) {
+    sessions.value[id].updatedAt = Date.now()
+  }
+}
+
+// ========== Initialization ==========
+function init() {
+  let saved = loadSessions()
+  if (!saved) {
+    // First visit: create a fresh session
+    const id = genId()
+    saved = { [id]: { title: '新对话', messages: [], updatedAt: Date.now() } }
+  }
+  sessions.value = saved
+  // Pick the most recently updated session as active
+  const latest = Object.entries(saved).sort(
+    (a, b) => b[1].updatedAt - a[1].updatedAt
+  )[0]
+  activeChatId.value = latest[0]
+}
+init()
+
+// ========== UI State ==========
+const question = ref('')
+const isStreaming = ref(false)
+const isWaiting = ref(false)
+const messagesContainer = ref(null)
+const inputEl = ref(null)
+let abortController = null
 
 // ========== Welcome Hints ==========
 const welcomeHints = [
@@ -264,41 +331,32 @@ async function scrollToBottom(smooth = true) {
   })
 }
 
-// ========== Save Chat Title ==========
-function saveChatTitle() {
-  const userMsg = messages.value.find(m => m.role === 'user')
-  const title = userMsg ? userMsg.content.slice(0, 30) + (userMsg.content.length > 30 ? '...' : '') : '新对话'
-
-  const existing = chatHistory.value.find(c => c.id === activeChatId.value)
-  if (existing) {
-    existing.title = title
-  } else if (messages.value.length > 0) {
-    chatHistory.value.unshift({ id: activeChatId.value, title })
-  }
-}
-
 // ========== Send ==========
 async function send() {
   const q = question.value.trim()
   if (!q || isStreaming.value) return
 
   question.value = ''
-  // Reset textarea height
-  if (inputEl.value) {
-    inputEl.value.style.height = 'auto'
-  }
+  if (inputEl.value) inputEl.value.style.height = 'auto'
 
-  messages.value.push({ role: 'user', content: q, streaming: false })
-  messages.value.push({ role: 'assistant', content: '', streaming: true })
+  const id = activeChatId.value
+  ensureSession(id)
+  const msgs = sessions.value[id].messages
 
-  // First user message -> auto-save to history
-  if (messages.value.filter(m => m.role === 'user').length === 1) {
-    saveChatTitle()
+  msgs.push({ role: 'user', content: q, streaming: false })
+  msgs.push({ role: 'assistant', content: '', streaming: true })
+
+  // First user message → set session title
+  const userCount = msgs.filter(m => m.role === 'user').length
+  if (userCount === 1) {
+    sessions.value[id].title = q.length > 30 ? q.slice(0, 30) + '...' : q
   }
+  touchSession(id)
+  schedulePersist()
 
   await scrollToBottom()
 
-  const aiIndex = messages.value.length - 1
+  const aiIndex = msgs.length - 1
   isStreaming.value = true
   isWaiting.value = true
 
@@ -324,23 +382,22 @@ async function send() {
       if (done) break
 
       let text = decoder.decode(value, { stream: true })
-      // Strip SSE protocol tokens
       text = text.replace(/data:\s*/g, '').replace(/\n\n/g, '').replace(/\n/g, '')
 
-      messages.value[aiIndex].content += text
+      msgs[aiIndex].content += text
       await scrollToBottom()
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
-      messages.value[aiIndex].content += `\n\n> ⚠️ 请求失败：${err.message}`
+      msgs[aiIndex].content += `\n\n> ⚠️ 请求失败：${err.message}`
     }
   } finally {
-    messages.value[aiIndex].streaming = false
+    msgs[aiIndex].streaming = false
     isStreaming.value = false
     isWaiting.value = false
     abortController = null
-    await nextTick()
-    // Re-render once more to ensure markdown is finalized
+    touchSession(id)
+    schedulePersist()  // persist after stream completes
   }
 }
 
@@ -362,7 +419,6 @@ async function copyMessage(text) {
   try {
     await navigator.clipboard.writeText(text)
   } catch {
-    // Fallback
     const ta = document.createElement('textarea')
     ta.value = text
     document.body.appendChild(ta)
@@ -375,31 +431,78 @@ async function copyMessage(text) {
 // ========== Chat Management ==========
 function newChat() {
   if (isStreaming.value) stopStreaming()
-  messages.value = []
-  activeChatId.value = genId()
+
+  // Remove empty sessions (except keep others)
+  const emptyIds = Object.entries(sessions.value)
+    .filter(([, s]) => s.messages.length === 0)
+    .map(([id]) => id)
+  for (const eid of emptyIds) {
+    delete sessions.value[eid]
+  }
+
+  // Create a fresh session
+  const id = genId()
+  sessions.value[id] = { title: '新对话', messages: [], updatedAt: Date.now() }
+  activeChatId.value = id
+  schedulePersist()
+
   sidebarCollapsed.value = false
-  // Focus input
-  nextTick(() => inputEl.value?.focus())
+  nextTick(() => {
+    inputEl.value?.focus()
+    scrollToBottom(false)
+  })
 }
 
 function switchChat(id) {
-  // Simple demo: just show alert (full persistence needs backend)
-  // For now, just set as active
+  if (id === activeChatId.value) return
+  if (isStreaming.value) stopStreaming()
   activeChatId.value = id
+  nextTick(() => {
+    scrollToBottom(false)
+    inputEl.value?.focus()
+  })
 }
 
 function deleteChat(id) {
-  chatHistory.value = chatHistory.value.filter(c => c.id !== id)
+  delete sessions.value[id]
+  schedulePersist()
+
   if (activeChatId.value === id) {
-    newChat()
+    // Switch to another session, or create a new one
+    const remaining = Object.keys(sessions.value)
+    if (remaining.length > 0) {
+      const latest = remaining.sort((a, b) =>
+        sessions.value[b].updatedAt - sessions.value[a].updatedAt
+      )[0]
+      activeChatId.value = latest
+    } else {
+      // No sessions left, create a fresh one
+      const newId = genId()
+      sessions.value[newId] = { title: '新对话', messages: [], updatedAt: Date.now() }
+      activeChatId.value = newId
+      schedulePersist()
+    }
   }
+  nextTick(() => scrollToBottom(false))
 }
 
-// ========== Auto-scroll on new messages ==========
+// ========== Auto-scroll on message content change ==========
 watch(
   () => messages.value.length,
   () => scrollToBottom(false)
 )
+
+// ========== Save during streaming ==========
+// Periodically persist while streaming, so partial content survives refresh
+let streamPersistInterval = null
+watch(isStreaming, (streaming) => {
+  if (streaming) {
+    streamPersistInterval = setInterval(schedulePersist, 3000)
+  } else {
+    clearInterval(streamPersistInterval)
+    streamPersistInterval = null
+  }
+})
 </script>
 
 <style scoped>
